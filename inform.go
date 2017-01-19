@@ -7,6 +7,7 @@ import (
 	"errors"
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/json"
 )
 
 // References
@@ -44,8 +45,8 @@ var (
 	defaultKey = "ba86f2bbe107c7c57eb5f2690775c712"
 )
 
-type InformPacket struct {
-	MagicHeader string `json:"magicHeader"`
+type RawInformPacket struct {
+	MagicHeader int `json:"magicHeader"`
 	Version int	`json:"version"`
 	MACBinary []byte `json:"-"`
 	MACHex string `json:"MACAddress"`
@@ -53,27 +54,45 @@ type InformPacket struct {
 	Data string `json:"data"`
 }
 
-func ParseInformPacket(r io.Reader) ( *InformPacket, error ) {
+type InformPacket interface {
 
-	newPacket := InformPacket{}
+}
 
-	// Magic Header - 4bytes = TNBU
-	bMagicHeader := make([]byte, 4)
-	c1, err := r.Read(bMagicHeader)
-	if( c1 != 4 || err != nil){
-		return nil, err
-	}
-	log.Printf("Magic: %s\n", bMagicHeader)
-	newPacket.MagicHeader = string(bMagicHeader)
+func bytesToInt(raw []byte) int {
+	if len(raw) == 2 { return int(raw[2]) << 8 | int(raw[3]) }
+	if len(raw) == 4 { return int(raw[0]) << 24 | int(raw[1]) << 16 | int(raw[2]) << 8 | int(raw[3]) }
+	return 0;
+}
+
+func readInt(r io.Reader) (int, error) {
+	bInt := make([]byte, 4)
+	rCount, err := r.Read(bInt)
+	if rCount != 4 { return 0, errors.New("Could not read int") }
+	if err != nil { return 0, err }
+	return bytesToInt(bInt), nil
+}
+
+func PKCS5UnPadding(src []byte) []byte {
+	length := len(src)
+	unpadding := int(src[length-1])
+	return src[:(length - unpadding)]
+}
+
+func ParseInformPacket(r io.Reader) ( *interface{}, error ) {
+
+	rawPacket := RawInformPacket{}
+
+	// Magic Header - 4bytes = 0x55424E54 = TNBU = 1430408788
+	bMagicHeader, err := readInt(r)
+	if err != nil { return nil, err }
+	rawPacket.MagicHeader = bMagicHeader
+	log.Printf("Magic: %d\n", rawPacket.MagicHeader)
 
 	// Version - 4 bytes
-	bVersion := make([]byte, 4)
-	c2, err := r.Read(bVersion)
-	if( c2 != 4 || err != nil){
-		return nil, err
-	}
-	newPacket.Version = int(bVersion[0]) << 24 | int(bVersion[1]) << 16 | int(bVersion[2]) << 8| int(bVersion[3])
-	log.Printf("Version: %d\n", newPacket.Version)
+	bVersion, err := readInt(r)
+	if( err != nil){ return nil, err }
+	rawPacket.Version = bVersion
+	log.Printf("Version: %d\n", rawPacket.Version)
 
 	// AP MAC Address - 6 bytes
 	bApMac := make([]byte, 6)
@@ -81,9 +100,9 @@ func ParseInformPacket(r io.Reader) ( *InformPacket, error ) {
 	if( c3 != 6 || err != nil){
 		return nil, err
 	}
-	newPacket.MACBinary = bApMac
-	newPacket.MACHex = hex.EncodeToString(bApMac)
-	log.Printf("MAC: %s\n", newPacket.MACHex)
+	rawPacket.MACBinary = bApMac
+	rawPacket.MACHex = hex.EncodeToString(bApMac)
+	log.Printf("MAC: %s\n", rawPacket.MACHex)
 
 	// isEncrypted and isCompressed options on packet - 2 bytes
 	bFlags := make([]byte, 2)
@@ -110,8 +129,8 @@ func ParseInformPacket(r io.Reader) ( *InformPacket, error ) {
 	if( c6 != 4 || err != nil){
 		return nil, err
 	}
-	newPacket.DataVersion = int(bDataVersion[0]) << 24 | int(bDataVersion[1]) << 16 | int(bDataVersion[2]) << 8| int(bDataVersion[3])
-	log.Printf("DataVersion: %d\n", newPacket.DataVersion)
+	rawPacket.DataVersion = bytesToInt(bDataVersion)
+	log.Printf("DataVersion: %d\n", rawPacket.DataVersion)
 
 	// Data Length - 4 bytes
 	bDataLength := make([]byte, 4)
@@ -119,7 +138,7 @@ func ParseInformPacket(r io.Reader) ( *InformPacket, error ) {
 	if( c7 != 4 || err != nil){
 		return nil, err
 	}
-	dataLength := int(bDataLength[0]) << 24 | int(bDataLength[1]) << 16 | int(bDataLength[2]) << 8| int(bDataLength[3])
+	dataLength := bytesToInt(bDataLength)
 	log.Printf("dataLength: %d\n", dataLength)
 
 	// Things we know now
@@ -145,16 +164,38 @@ func ParseInformPacket(r io.Reader) ( *InformPacket, error ) {
 		log.Println("Data is compressed")
 	}
 
+	log.Println("Decrypting packet")
 	bDefaultKey, _ := hex.DecodeString(defaultKey)
 	block, err := aes.NewCipher(bDefaultKey)
 	if err != nil {
 		log.Println("Cannot init IV")
 		return nil, err
 	}
+	if len(bData)%aes.BlockSize != 0 {
+		log.Println("ciphertext is not a multiple of the block size")
+		return nil, errors.New("ciphertext is not a multiple of the block size")
+	}
 	mode := cipher.NewCBCDecrypter(block, bEncIV)
-	mode.CryptBlocks(bData, bData)
-	newPacket.Data = string(bData)
 
+	bDataDecoded := make([]byte, dataLength)
+	mode.CryptBlocks(bData, bData)
+	bData = PKCS5UnPadding(bData)
+	rawPacket.Data = string(bData)
+
+	log.Printf("RAW bData: %s\n", hex.EncodeToString(bData))
+	log.Printf("RAW bDataDecoded: %s\n", hex.EncodeToString(bDataDecoded))
+
+
+	log.Println("Decocing packet JSON")
+	var newPacket interface{}
+	jsonErr := json.Unmarshal(bData, &newPacket)
+	if jsonErr != nil {
+		log.Printf("Could not parse packet json: %s\n", jsonErr.Error())
+		log.Println("Raw JSON:")
+		log.Println(string(bData))
+		return nil, jsonErr
+	}
 
 	return &newPacket, nil
 }
+
